@@ -20,21 +20,49 @@ logging.basicConfig(
     stream=sys.stdout)
 LOGGER = logging.getLogger(__name__)
 
-logging.getLogger('taskgraph').setLevel('INFO')
-
 
 _TARGET_NODATA_INT = -1
 
 
-def lulc_transition_matrix(from_raster_path, to_raster_path, transition_raster_path, raster_csv_path, out_csv_path):
-    """Create a tabular matrix of transitioning LULC classes.
+def lulc_transition_matrix(
+        from_raster_path, to_raster_path, transition_raster_path,
+        raster_csv_path, out_csv_path):
+    """Create a tabular transition matrix, transition raster, and raster table.
+
+    This function creates the following three outputs:
+        Transition matrix (CSV) - a matrix with "From/To" rows and columns
+            where the row keys represent the "from" raster classes, the column
+            keys represent the "to" raster classes, and the values are the
+            counts for how many times the transition occurs. NoData values are
+            included in the row, column keys.
+
+        Transition raster (tif) - a raster of new integer values that
+            represent transitions.
+
+            The transition raster has the following special cases:
+            # nodata -> nodata - should output nodata
+            # x -> x - unchanged values should output the same new class
+            # x -> nodata  - should output a new class value
+            # nodata -> y - should output a new class value
+
+        Transition raster table (CSV) - an accompanying table to the transition
+            raster that has two columns, "Transition Class" and "Transition".
+            "Transition Class" indicates the new class given the unique
+            transition which is described in the "Transition" column.
 
     Args:
-        from_raster_path (string) - 
-        to_raster_path (string) - 
-        out_csv_path (string) -
+        from_raster_path (string) - path on disk to the raster to transition
+            from.
+        to_raster_path (string) -  path on disk to the raster transitioned
+            to.
+        transition_raster_path (string) - path on disk to write the new
+            transition raster.
+        raster_csv_path (string) - path on disk to write the raster table that
+            maps the transition path.
+        out_csv_path (string) - path on disk to write the transition matrix.
 
     Return:
+        None
 
     """
     from_raster_info = pygeoprocessing.get_raster_info(from_raster_path)
@@ -45,8 +73,10 @@ def lulc_transition_matrix(from_raster_path, to_raster_path, transition_raster_p
     # Align rasters
     from_raster_aligned_name = f'{os.path.splitext(os.path.basename(from_raster_path))[0]}_aligned.tif'
     to_raster_aligned_name = f'{os.path.splitext(os.path.basename(to_raster_path))[0]}_aligned.tif'
-    aligned_from_raster_path = os.path.join(os.path.dirname(from_raster_path), from_raster_aligned_name)
-    aligned_to_raster_path = os.path.join(os.path.dirname(to_raster_path), to_raster_aligned_name)
+    aligned_from_raster_path = os.path.join(
+            os.path.dirname(from_raster_path), from_raster_aligned_name)
+    aligned_to_raster_path = os.path.join(
+            os.path.dirname(to_raster_path), to_raster_aligned_name)
 
     pygeoprocessing.align_and_resize_raster_stack(
         [from_raster_path, to_raster_path],
@@ -58,6 +88,7 @@ def lulc_transition_matrix(from_raster_path, to_raster_path, transition_raster_p
         aligned_from_raster_path, transition_raster_path, gdal.GDT_Int32,
         [_TARGET_NODATA_INT])
 
+    # Open rasters and get band for iterblocks
     from_raster = gdal.OpenEx(aligned_from_raster_path, gdal.OF_RASTER)
     from_raster_band = from_raster.GetRasterBand(1)
     to_raster = gdal.OpenEx(aligned_to_raster_path, gdal.OF_RASTER)
@@ -65,25 +96,22 @@ def lulc_transition_matrix(from_raster_path, to_raster_path, transition_raster_p
     transition_raster = gdal.OpenEx(transition_raster_path, gdal.OF_RASTER | gdal.GA_Update)
     transition_raster_band = transition_raster.GetRasterBand(1)
 
+    # Set up for tracking transition csv matrix
     transition_map = {}
     from_raster_unique_values = set()
     to_raster_unique_values = set()
     # Set up for tracking transition raster information
-    transition_code = {}
-    transition_strings = {}
+    transition_str_dict = {}
     transition_index = 1
-    transition_same = 0
+    unchanged_value = 0
     transition_class_key = {0: "unchanged"}
-    # Special cases:
-    # nodata -> nodata should output _TARGET_NODATA
-    # x -> x (value does not change) should output as 0
-    # x -> nodata should output a new class value
-    # nodata -> y should output a new class value
 
+    # Info needed for logging progress
     n_cols, n_rows = from_raster_info['raster_size']
     last_log_time = time.time()
     n_pixels_processed = 0
     n_pixels_to_process = n_cols * n_rows
+
     for block_info, from_raster_matrix in pygeoprocessing.iterblocks((aligned_from_raster_path, 1)):
         to_raster_matrix = to_raster_band.ReadAsArray(**block_info)
 
@@ -94,7 +122,6 @@ def lulc_transition_matrix(from_raster_path, to_raster_path, transition_raster_p
         to_raster_unique_values.update(to_raster_unique)
 
         # Mask nodata if both from_raster and to_raster are nodata
-        # TODO
         nodata_mask = (
                 utils.array_equals_nodata(from_raster_matrix, from_nodata) &
                 utils.array_equals_nodata(to_raster_matrix, to_nodata))
@@ -132,32 +159,16 @@ def lulc_transition_matrix(from_raster_path, to_raster_path, transition_raster_p
 
                 # Transition raster and table
 
-                # Approach #1
                 # If transition does not change, use "same" code
-#                code_to_use = transition_same
-#                if from_raster_value != to_raster_value:
-#                    code_to_use = transition_index
-#                    if from_raster_value not in transition_code:
-#                        transition_code[from_raster_value] = {to_raster_value: code_to_use}
-#                        transition_index += 1
-#                    elif to_raster_value not in transition_code[from_raster_value]:
-#                        transition_code[from_raster_value][to_raster_value] = code_to_use
-#                        transition_index +=1
-#                    else:
-#                        code_to_use = transition_code[from_raster_value][to_raster_value]
-
-
-                # Approach #2
-                # If transition does not change, use "same" code
-                code_to_use = transition_same
+                code_to_use = unchanged_value
                 if from_raster_value != to_raster_value:
                     code_to_use = transition_index
-                    transition_char = f'{from_raster_value} to {to_raster_value}'
-                    if transition_char not in transition_strings:
-                        transition_strings[transition_char] = code_to_use
+                    transition_str_key = f'{from_raster_value} to {to_raster_value}'
+                    if transition_str_key not in transition_str_dict:
+                        transition_str_dict[transition_str_key] = code_to_use
                         transition_index += 1
                     else:
-                        code_to_use = transition_strings[transition_char]
+                        code_to_use = transition_str_dict[transition_str_key]
 
                 if code_to_use not in transition_class_key:
                     transition_class_key[code_to_use] = f'{from_raster_value} to {to_raster_value}'
@@ -177,10 +188,12 @@ def lulc_transition_matrix(from_raster_path, to_raster_path, transition_raster_p
     LOGGER.info('100.0% complete')
 
 
-    from_raster = None
     from_raster_band = None
-    to_raster = None
+    from_raster = None
     to_raster_band = None
+    to_raster = None
+    transition_band = None
+    transition_raster = None
 
     # Write out transitions to CSV
     with open(out_csv_path, 'w', newline='') as csv_file:
@@ -199,7 +212,6 @@ def lulc_transition_matrix(from_raster_path, to_raster_path, transition_raster_p
     # Write out raster table transitions to CSV
     with open(raster_csv_path, 'w', newline='') as csv_file:
         writer = csv.writer(csv_file)
-        transition_code[from_raster_value] = {to_raster_value: code_to_use}
         header = ["Transition Class", "Transition"]
         writer.writerow(header)
         nodata_row = ["-1 (nodata)", "nodata to nodata"]
